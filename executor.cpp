@@ -16,6 +16,11 @@
 #include <unistd.h>
 #include <unordered_map>
 #include <vector>
+
+#define MAX_TASKS 4096
+#define MAX_CHAR_IN 512
+#define MAX_CHAR_OUT 1024
+
 using namespace std;
 bool debug = false;
 std::mutex g_mutex;
@@ -26,10 +31,23 @@ unordered_map<int, string> tasks_err;
 std::mutex tasks_mutex_err;
 unordered_map<int, int> tasks_kill;
 std::mutex tasks_mutex_kill;
+mutex tasks_mutex;
+mutex one_command_mutex;
 bool incommand;
 mutex incommand_mutex;
 string g_data;
 deque<string> task_messages;
+
+struct Task{
+
+    string out;
+    string err;
+    pid_t child_pid;
+    int id;
+    bool is_active = false;
+};
+
+struct Task tasks[MAX_TASKS];
 
 template <typename T>
 class bqueue
@@ -119,7 +137,6 @@ void run(vector<string> argv, int index) { //function for run command
     if (pid == -1) exit(1);
 
     if (pid == 0) { //child process for execvp
-        cout << "Task "<<index<<" started: pid " << getpid() << '.' << endl;
         close(fdout[0]);
         close(fderr[0]);
 
@@ -138,12 +155,22 @@ void run(vector<string> argv, int index) { //function for run command
         args[i] = nullptr;
         args[i+2] = nullptr;
 
+        tasks_mutex.lock();
+        tasks[index].child_pid = getpid();
+        tasks[index].is_active = true;
 
+        tasks_mutex.unlock();
+        //one_command_mutex.unlock();
         execvp(args[0], args);
         cout << "command didnt work" << endl;
     }
     thread readout(readpipe, fdout, index, true);
     thread readerr(readpipe, fderr, index, false);
+
+    if (pid != 0){
+        cout << "Task "<<index<<" started: pid " << pid << '.' << endl;
+        one_command_mutex.unlock();
+    }
     tasks_mutex_kill.lock();
     tasks_kill[index] = pid;
     tasks_mutex_kill.unlock();
@@ -183,15 +210,19 @@ void task_kill(int T){
     if (tasks_kill[T] != 0) kill(tasks_kill[T], SIGINT);
     tasks_mutex_kill.unlock();
 }
+
+
 int main() {
-
+    one_command_mutex.lock();
     int index = 0;
-    std::vector<std::thread> threads; // threads for new tasks
+    int switch_ = 0;
+    int T = -1;
     std::thread exec_input(producerThread); // thread to read input
-
+    vector<string> token;
+    vector<thread> threads;
 
     while(true){ //main process loop
-
+        //checking for awaiting messages for executor to print out
         incommand_mutex.lock();
         incommand = false;
         while(!task_messages.empty()){
@@ -200,33 +231,22 @@ int main() {
             task_messages.pop_front();
         }
         incommand_mutex.unlock();
+        //await new command on blocking queue
         string command = commands.pop(); //pop command from input queue
+        //set bool incommand to true
         incommand_mutex.lock();
         incommand = true;
         incommand_mutex.unlock();
+
         if (debug) cout << "The value read: " << command << endl;
-        if(command.empty())continue;
-        char* arguments[512];
-        char** next = arguments;
-        int c = 0;
-        int switch_ = 0;
-        int T = -1;
-
-        string delimiter = " ";
-
         istringstream my_stream(command);
-
-
-        // To store the stream string
-
-
-        size_t pos = -1;
-        int i =0;
-        vector<string> token;
+        int i = 0;
         token.clear();
         string tmp;
+        switch_ = 0;
         // Traverse till stream is valid
         while (my_stream >> tmp) {
+            if(tmp.empty())continue;
             token.push_back(tmp);
             i++;
             if (switch_ == 0) { //check the command
@@ -257,8 +277,15 @@ int main() {
             break;
         }
         if (switch_ == 1) {
+            threads.emplace_back(run, token, index);
 
-            threads.emplace_back(run, token, index++);
+            one_command_mutex.lock();
+
+
+            tasks_mutex.lock();
+            tasks[index].id = index;
+            tasks_mutex.unlock();
+            index++;
         }
         else if (switch_ == 2) {
             tasks_mutex_out.lock();
@@ -288,10 +315,15 @@ int main() {
     }
     incommand_mutex.unlock();
 
-    exec_input.join();
+
+    //joining all task threads
+    tasks_mutex.lock();
     for( auto &thread : threads){
         thread.join();
     }
+    tasks_mutex.unlock();
+    exec_input.join();
+
     if(debug)cout << "Executor finished" << endl;
     return 0;
 }
