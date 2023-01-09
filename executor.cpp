@@ -16,7 +16,7 @@
 #include <unistd.h>
 #include <unordered_map>
 #include <vector>
-
+#include <semaphore.h>
 #define MAX_TASKS 4096
 #define MAX_CHAR_IN 512
 #define MAX_CHAR_OUT 1024
@@ -37,7 +37,7 @@ bool incommand;
 mutex incommand_mutex;
 string g_data;
 deque<string> task_messages;
-
+sem_t one_command_semaphore;
 struct Task{
 
     string out;
@@ -75,7 +75,9 @@ public:
         this->d_condition.notify_one();
     }
 };
-bqueue<string> commands;
+
+
+
 bool check(string data){
     istringstream my_stream(data);
     string token;
@@ -84,13 +86,13 @@ bool check(string data){
     return false;
 }
 
-void producer() {
+void producer(bqueue<string>* commands) {
     while (getline(cin, g_data)) {
-        commands.push(g_data);
+        commands->push(g_data);
         if(check(g_data))break;
     }
     //commands.release();
-    commands.push("quit");
+    commands->push("quit");
 }
 
 void readpipe(int fd[], int index, bool is_out){
@@ -169,7 +171,8 @@ void run(vector<string> argv, int index) { //function for run command
 
     if (pid != 0){
         cout << "Task "<<index<<" started: pid " << pid << '.' << endl;
-        one_command_mutex.unlock();
+        //one_command_mutex.unlock();
+        sem_post(&one_command_semaphore);
     }
     tasks_mutex_kill.lock();
     tasks_kill[index] = pid;
@@ -203,7 +206,7 @@ void run(vector<string> argv, int index) { //function for run command
 }
 
 
-void producerThread() { producer(); }
+void producerThread(bqueue<string>* commands) { producer(commands); }
 
 void task_kill(int T){
     tasks_mutex_kill.lock();
@@ -213,11 +216,14 @@ void task_kill(int T){
 
 
 int main() {
-    one_command_mutex.lock();
+    bqueue<string> commands;
+    sem_init(&one_command_semaphore, 0, 0);
+    mutex thread_creation;
+    //one_command_mutex.lock();
     int index = 0;
     int switch_ = 0;
     int T = -1;
-    std::thread exec_input(producerThread); // thread to read input
+    std::thread exec_input(producerThread,&commands); // thread to read input
     vector<string> token;
     vector<thread> threads;
 
@@ -277,10 +283,11 @@ int main() {
             break;
         }
         if (switch_ == 1) {
+            thread_creation.lock();
             threads.emplace_back(run, token, index);
-
-            one_command_mutex.lock();
-
+            thread_creation.unlock();
+            //one_command_mutex.lock();
+            sem_wait(&one_command_semaphore);
 
             tasks_mutex.lock();
             tasks[index].id = index;
